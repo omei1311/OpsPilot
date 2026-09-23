@@ -1,0 +1,43 @@
+# ============================================================
+# 国内网络环境下的构建覆盖文件
+#
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 为什么需要这个文件？
+#   Docker Hub 在国内经常拉不动（被墙，或者代理链路不通）。
+#   这里把基础镜像替换成国内可用的镜像源，绕开这个问题。
+#
+#   两个文件叠加使用时，这个文件里的 build.args 会【合并】进
+#   主 compose 文件的服务定义，其他配置不变。
+#
+# ⚠️ 这些镜像源是第三方服务，可用性会变。
+#    如果构建时提示拉不到，换一个源，或者用下面 daemon.json 的方案。
+#
+# ── 另一个更彻底的方案（配置一次，所有 docker pull 都受益）──
+#
+#   编辑 C:\Users\<你的用户名>\.docker\daemon.json，加上：
+#
+#   {
+#     "registry-mirrors": [
+#       "https://dockerproxy.net",
+#       "https://docker.1panel.live",
+#       "https://docker.m.daocloud.io"
+#     ]
+#   }
+#
+#   然后在 Docker Desktop 里点 Restart。
+#   之后就不需要这个 build.yml 了，直接 docker compose up -d --build。
+# ============================================================
+
+services:
+  backend:
+    build:
+      args:
+        BASE_IMAGE: dockerproxy.net/library/python:3.11-slim
+
+  frontend:
+    build:
+      args:
+        NODE_IMAGE: dockerproxy.net/library/node:20-alpine
+        NGINX_IMAGE: dockerproxy.net/library/nginx:alpine

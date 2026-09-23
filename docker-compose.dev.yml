@@ -1,0 +1,105 @@
+# ============================================================
+# OpsPilot 本地开发依赖（只起基础设施，不起应用）
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# 后端在宿主机用 uvicorn 跑，连这里的 MySQL。
+# 好处：改代码即时热重载，不用每次重建镜像。
+#
+# 完整的全栈 docker-compose.yml（backend + frontend + mysql + redis）
+# 会在后面的阶段补上。
+# ============================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: opspilot-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456
+      MYSQL_DATABASE: opspilot
+      MYSQL_USER: opspilot
+      MYSQL_PASSWORD: opspilot123
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      # utf8mb4_unicode_ci 在中文排序上比默认的 utf8mb4_0900_ai_ci 更符合直觉
+      - --collation-server=utf8mb4_unicode_ci
+      # 存储 UTC，由应用层负责时区转换
+      - --default-time-zone=+00:00
+      # 显式指定认证插件，避免旧客户端连不上 caching_sha2_password
+      - --default-authentication-plugin=mysql_native_password
+      # 开发环境放宽：单条 SQL 包体上限调大，方便后续存 Agent 的 JSON payload
+      - --max_allowed_packet=64M
+    ports:
+      # 宿主机 3307 → 容器 3306，避免和本机已装的 MySQL 抢占 3306
+      - "3307:3306"
+    volumes:
+      - opspilot-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123456"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  redis:
+    # 用 redis-stack-server 而不是官方 redis:7-alpine。
+    #
+    # 原因：本机 Docker 拉不了新镜像（代理问题，见 README），
+    # 而这个镜像本地已经有了。它是 Redis 的超集（多了 RedisJSON、
+    # RediSearch 等模块），用来存 JWT 黑名单完全够用。
+    #
+    # 如果你能正常拉镜像，换成 redis:7-alpine 也一样，命令参数通用。
+    image: redis/redis-stack-server:latest
+    container_name: opspilot-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      # ★ 必须关掉 protected mode。
+      #
+      # Redis 开启 protected mode 时（默认就是开的，且没有设密码时），
+      # 只接受来自【容器内部回环地址】的连接。
+      # 我们从宿主机通过端口映射连过去，Redis 判定为外部连接，直接拒绝：
+      #     DENIED Redis is running in protected mode ...
+      #
+      # 关掉它是安全的 —— 因为下面的端口映射已经限制成只监听 127.0.0.1，
+      # 外部网络根本连不进来。这两件事必须配套做，不能只做一半。
+      - --protected-mode
+      - "no"
+      # appendonly yes：开启 AOF 持久化。
+      # Redis 默认纯内存，重启就丢。黑名单丢了影响不大（用户重新登录即可），
+      # 但开着更稳妥，代价很小。
+      - --appendonly
+      - "yes"
+      # 内存上限 + 淘汰策略：防止 Redis 把机器内存吃满。
+      # allkeys-lru = 内存满时淘汰最久未使用的 key。
+      # 最坏情况是淘汰掉某条黑名单记录 —— 影响可接受。
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      # ★ 宿主机 6380 → 容器 6379，且只绑定到 127.0.0.1。
+      #
+      # 写成 "127.0.0.1:6380:6379" 而不是 "6380:6379"：
+      # 后者会监听 0.0.0.0，也就是【同一 WiFi 下的任何人都能连你的 Redis】。
+      # 而我们刚关掉了 protected mode，裸奔的 Redis 被扫到是很危险的
+      # （会被用来挖矿、当跳板）。
+      #
+      # 只绑本机，开发够用，且安全。
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - opspilot-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  opspilot-mysql-data:
+    name: opspilot-mysql-data
+  opspilot-redis-data:
+    name: opspilot-redis-data

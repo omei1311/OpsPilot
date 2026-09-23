@@ -1,0 +1,65 @@
+# ── Web 框架 ──────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+# FastAPI 的底层框架。虽然装 FastAPI 时会自动带上它，
+# 但我们的代码【直接 import 了】它：
+#   starlette.concurrency.run_in_threadpool  —— 把 bcrypt 丢进线程池
+#   starlette.exceptions.HTTPException       —— 全局异常处理
+# 直接依赖就应该显式声明：万一哪天 FastAPI 不再依赖 starlette
+# （或换了实现），显式声明能让问题在安装时就暴露，而不是运行时。
+starlette>=0.40.0
+
+# ── 配置与校验 ────────────────────────────────────────────
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
+# ★ EmailStr 类型的运行时依赖。
+#
+# Pydantic 的 EmailStr 是"延迟导入"的 —— 只有真正用到它时才会去
+# import email_validator。所以：
+#   · 本地开发时手动 pip install 过一次，就一直能跑
+#   · 但 requirements.txt 里没写，容器里全新安装就缺这个包
+#   · 表现是应用启动直接崩：ImportError: email-validator is not installed
+#
+# 这就是经典的"在我机器上能跑"。凡是代码用到的包，不管是不是直接
+# import，都必须写进依赖清单 —— 靠手动装过是记不住的。
+email-validator>=2.2.0
+# Windows 没有系统时区库，zoneinfo 需要它才能解析 Asia/Shanghai；
+# Alembic 的 timezone 配置项和后续做 UTC→本地时区转换都依赖它。
+tzdata>=2024.1
+
+# ── 数据库 ────────────────────────────────────────────────
+SQLAlchemy>=2.0.36
+alembic>=1.14.0
+
+# ── 认证 ──────────────────────────────────────────────────
+# 直接用 bcrypt 而不是 passlib：passlib 1.7.4 配 bcrypt 4.x 会打
+# "module 'bcrypt' has no attribute '__about__'" 的警告，且它已多年不更新。
+# bcrypt 本身只有两个函数（hashpw / checkpw），没必要再包一层。
+bcrypt>=4.2.0
+# PyJWT 比 python-jose 轻，且 python-jose 有未修复的 CVE
+PyJWT>=2.9.0
+
+# MySQL 异步驱动。
+# asyncmy: 性能更好（C 扩展），Linux/macOS 有预编译 wheel，Docker 内默认使用。
+# aiomysql: 纯 Python 实现，任何平台都能装，Windows 本地开发装不上 asyncmy 时改用它。
+# 切换方式：改 .env 里的 DB_DRIVER=aiomysql 并 pip install aiomysql
+asyncmy>=0.2.10
+aiomysql>=0.2.0
+
+# ── 测试（开发依赖）────────────────────────────────────────
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+httpx>=0.27.0
+
+# ── Agent / LLM ────────────────────────────────────────────
+# 只装 langchain-core（工具定义）+ langchain-openai（OpenAI 兼容客户端）
+# + langgraph（状态图）。不装 langchain 全家桶，避免一堆用不上的依赖。
+langchain-core>=0.3.0
+langchain-openai>=0.3.0
+langgraph>=0.2.60
+# ── 缓存 / JWT 黑名单 ──────────────────────────────────────
+# redis-py 8.x，异步 API 在 redis.asyncio 下。
+# 注意：加版本约束（如 >=5.2.0）时 pip 解析会失败，
+# 不加约束能正常安装 —— 具体原因不明，先不写约束。
+redis

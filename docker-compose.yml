@@ -1,0 +1,180 @@
+# ============================================================
+# OpsPilot 全栈部署
+#
+#   docker compose up -d --build
+#
+# 起来后访问 http://127.0.0.1:8080
+#
+# 和 docker-compose.dev.yml 的区别：
+#   dev  —— 只起 MySQL + Redis，前后端在宿主机跑（改代码热重载）
+#   这个 —— 四个服务全部容器化，模拟真实部署
+#
+# ★ MySQL 和 Redis 的端口【不映射到宿主机】。
+#   它们只在 compose 内部网络里能被 backend 访问到。
+#   这是生产环境的正确做法：数据库不对外暴露，减少攻击面。
+#   如果你想像 dev 那样用本机工具连数据库调试，把注释掉的 ports 打开。
+# ============================================================
+
+services:
+  # ══════════════════════════════════════════════════════════
+  # 数据库
+  # ══════════════════════════════════════════════════════════
+  mysql:
+    image: mysql:8.0
+    container_name: opspilot-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123456}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-opspilot}
+      MYSQL_USER: ${MYSQL_USER:-opspilot}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-opspilot123}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # 统一存 UTC，由应用层负责时区转换
+      - --default-time-zone=+00:00
+      - --default-authentication-plugin=mysql_native_password
+      - --max_allowed_packet=64M
+    volumes:
+      - opspilot-mysql-data:/var/lib/mysql
+    # ports:
+    #   - "127.0.0.1:3307:3306"   # 需要本机连数据库调试时打开
+    healthcheck:
+      # ★ 健康检查是启动顺序的关键。
+      #   backend 会 depends_on 这个条件，等 MySQL 真的能接受连接了才启动。
+      #   只用 depends_on: mysql 是不够的 —— 那只能保证容器"启动了"，
+      #   而 MySQL 启动到能接受连接之间还有十几秒。
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root123456}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - opspilot
+
+  # ══════════════════════════════════════════════════════════
+  # 缓存（JWT 黑名单）
+  # ══════════════════════════════════════════════════════════
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: opspilot-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      # 关掉 protected mode 才能从其他容器连进来。
+      # 安全靠"不映射端口到宿主机"来保证，不是靠 protected mode。
+      - --protected-mode
+      - "no"
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - opspilot-redis-data:/data
+    # ports:
+    #   - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - opspilot
+
+  # ══════════════════════════════════════════════════════════
+  # 后端
+  # ══════════════════════════════════════════════════════════
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: opspilot-backend
+    restart: unless-stopped
+    environment:
+      # ★ 容器之间用【服务名】通信，不是 localhost。
+      #   compose 会自动建一个网络并把服务名解析成容器 IP。
+      #   写成 127.0.0.1 的话会连到容器自己，不是数据库容器。
+      MYSQL_HOST: mysql
+      # 容器内是标准端口 3306（宿主机映射成 3307 是另一回事）
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-opspilot}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-opspilot123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-opspilot}
+      REDIS_URL: redis://redis:6379/0
+
+      # 大模型配置 —— 从宿主机环境变量或 .env 传入
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-qwen-plus}
+
+      APP_ENV: ${APP_ENV:-dev}
+      DEBUG: ${DEBUG:-false}
+      # 前端通过 nginx 同源访问，理论上不需要 CORS；
+      # 但保留一项以防你用别的端口调试前端
+      CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+      SECRET_KEY: ${SECRET_KEY:-dev-only-secret-change-me-in-production}
+      TZ: Asia/Shanghai
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # ports:
+    #   - "127.0.0.1:8000:8000"   # 需要直接访问后端接口时打开
+    networks:
+      - opspilot
+
+  # ══════════════════════════════════════════════════════════
+  # 前端（nginx 托管静态资源 + 反代 API）
+  # ══════════════════════════════════════════════════════════
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: opspilot-frontend
+    restart: unless-stopped
+    ports:
+      # ★ 唯一对外暴露的端口。所有流量从这里进：
+      #     静态资源 → nginx 自己处理
+      #     /api/*   → 反代给 backend
+      #   只绑 127.0.0.1 的话外部访问不了；
+      #   如果你想让同一局域网的人访问，改成 "8080:80"。
+      - "8080:80"
+    depends_on:
+      # 这里用 service_started 而不是 service_healthy：
+      # nginx 启动很快，不需要等 backend 完全就绪。
+      # 反代是运行时的，backend 慢一点起来也不影响 nginx 先启动。
+      - backend
+    networks:
+      - opspilot
+
+# ══════════════════════════════════════════════════════════════
+# 数据卷
+# ══════════════════════════════════════════════════════════════
+#
+# ★ 没有 volumes 的话，容器删掉数据就没了。
+#   named volume 让数据独立于容器生命周期存在。
+#
+#   注意：docker compose down 会保留 volume，
+#         docker compose down -v 才会连数据一起删。
+volumes:
+  opspilot-mysql-data:
+    name: opspilot-mysql-data
+  opspilot-redis-data:
+    name: opspilot-redis-data
+
+# ══════════════════════════════════════════════════════════════
+# 网络
+# ══════════════════════════════════════════════════════════════
+#
+# compose 默认会建一个网络，显式声明是为了给个有意义的名字。
+# 在这个网络里，服务名就是主机名 —— backend 能直接用 "mysql"
+# 和 "redis" 这两个名字连到对应容器。
+networks:
+  opspilot:
+    name: opspilot-network
+    driver: bridge

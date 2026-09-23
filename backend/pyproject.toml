@@ -1,0 +1,39 @@
+# 只放工具配置。依赖声明统一在 requirements.txt 里，避免两处维护。
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# -q 精简输出；--strict-markers 让拼错的 marker 直接报错而不是静默忽略
+addopts = "-q --strict-markers --tb=short"
+markers = [
+    "no_db: 不依赖数据库的测试，任何环境都应通过",
+]
+# 关掉第三方库的无关告警噪音
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle 错误
+    "F",   # pyflakes
+    "I",   # isort 导入排序
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # 行长交给 formatter 处理，注释里难免有长句
+    "B008",  # FastAPI 的 Depends()/Query() 就是要在默认值位置调用
+]
+
+[tool.ruff.lint.per-file-ignores]
+"alembic/env.py" = ["E402"]  # 需要在 sys.path 调整后再 import
+"tests/*" = ["SIM117"]
+
+[tool.ruff.format]
+quote-style = "double"

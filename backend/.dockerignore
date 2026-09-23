@@ -1,0 +1,43 @@
+# ============================================================
+# Docker 构建时忽略的文件
+#
+# 作用有两个：
+#   ① 减小构建上下文体积（构建时要把整个目录发给 Docker daemon）
+#      .venv 有几百 MB，不排除的话每次构建都要传一遍
+#   ② 避免把本机的东西带进镜像
+#      .env 里有你的 API Key，绝不能进镜像
+# ============================================================
+
+# 虚拟环境 —— 镜像里会重新装依赖，这个完全不需要
+.venv/
+venv/
+env/
+
+# 环境变量（★ 里面有 API Key 和数据库密码）
+.env
+.env.*
+!.env.example
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 测试和脚本（镜像里不需要）
+tests/
+scripts/
+
+# 版本控制与 IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# 本地日志与临时文件
+*.log
+logs/
+run.out.log
+run.err.log
