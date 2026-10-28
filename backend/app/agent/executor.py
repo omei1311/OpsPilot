@@ -16,13 +16,13 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.models.agent import AgentPendingAction, PendingActionStatus
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.services.agent_service import AgentService
-from app.services.ticket_service import TicketService
 
 logger = get_logger(__name__)
 
@@ -32,6 +32,22 @@ TOOL_EXECUTORS = {
     "batch_update_tickets": "batch_update",
     "batch_assign_tickets": "batch_assign",
 }
+
+
+async def _execute_ticket_tool(
+    db: AsyncSession, tool_name: str, args: dict[str, Any], ticket_ids: list[int], user: User
+) -> dict[str, Any]:
+    """业务写入边界；缓存/Redis 等依赖只在真正执行工具时加载。"""
+    from app.services.ticket_service import TicketService
+
+    allowed_fields = (
+        ("priority", "category", "department_id")
+        if tool_name == "batch_update_tickets"
+        else ("department_id", "assignee_id")
+    )
+    changes = {key: value for key, value in args.items() if key in allowed_fields and value is not None}
+    executor = getattr(TicketService, TOOL_EXECUTORS[tool_name])
+    return await executor(db, ticket_ids, operator=user, **changes)
 
 
 async def execute_action(
@@ -81,8 +97,22 @@ async def execute_action(
     # 这就是"TOCTOU（Time-of-Check to Time-of-Use）"问题 ——
     # 检查时刻和使用时刻状态不一致。凡是"先检查、隔一会儿再执行"
     # 的流程都要注意。
-    if not user.is_active:
-        result = {"ok": False, "error": "当前账号已被禁用"}
+    # 请求中的 ORM User 可能仍缓存着审批前的 admin 身份。重新读取并将
+    # 最新主体交给业务服务，避免管理员被降权后仍按旧角色批量操作。
+    current_user = await db.scalar(
+        select(User)
+        .where(User.id == user.id)
+        .execution_options(populate_existing=True, autoflush=False)
+    )
+    if current_user is None or not current_user.is_active:
+        result = {"ok": False, "error": "当前账号不存在或已被禁用"}
+        await AgentService.mark_action_result(
+            db, action, status=PendingActionStatus.FAILED, result=result
+        )
+        return result
+    user = current_user
+    if action.requested_by != user.id and user.role != UserRole.ADMIN:
+        result = {"ok": False, "error": "当前账号已无权执行该审批计划"}
         await AgentService.mark_action_result(
             db, action, status=PendingActionStatus.FAILED, result=result
         )
@@ -90,33 +120,13 @@ async def execute_action(
 
     # ── 执行 ───────────────────────────────────────────────
     try:
-        if tool_name == "batch_update_tickets":
-            # changes 里是 priority / category / department_id
-            changes = {
-                k: v
-                for k, v in args.items()
-                if k in ("priority", "category", "department_id") and v is not None
-            }
-            raw = await TicketService.batch_update(
-                db, ticket_ids, operator=user, **changes
-            )
-
-        elif tool_name == "batch_assign_tickets":
-            changes = {
-                k: v
-                for k, v in args.items()
-                if k in ("department_id", "assignee_id") and v is not None
-            }
-            raw = await TicketService.batch_assign(
-                db, ticket_ids, operator=user, **changes
-            )
-
-        else:
+        if tool_name not in TOOL_EXECUTORS:
             result = {"ok": False, "error": f"不支持的工具：{tool_name}"}
             await AgentService.mark_action_result(
                 db, action, status=PendingActionStatus.FAILED, result=result
             )
             return result
+        raw = await _execute_ticket_tool(db, tool_name, args, ticket_ids, user)
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("批量执行失败 | action_id=%s", action.action_id)
