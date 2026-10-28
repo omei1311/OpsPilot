@@ -1,18 +1,56 @@
-# OpsPilot · 企业智能工单与运营协同平台
+# OpsPilot · 工单业务与 Agent 审批执行
 
-> 一个**能真正操作业务数据**的 AI Agent 系统 —— 不是聊天机器人，也不是 Todo List。
->
-> 它首先是一套完整的企业工单系统（工单流转 / 状态机 / SLA / 审计 / 数据看板），
-> 在此之上内置一个 Copilot：理解自然语言、调用业务工具、SSE 流式反馈执行过程，
-> 并在**改动数据之前必须拿到人工确认**。
+面向运维工单场景的个人工程项目：FastAPI 提供工单、角色权限、SLA 和统计服务，Vue 3 提供业务界面，LangGraph Agent 通过业务工具完成自然语言查询与操作。项目重点是 **Agent 如何复用业务规则，以及批量操作如何先核对计划、再确认执行**。
 
-**技术关键词**：LangGraph · Tool Calling · Structured Output · Human-in-the-loop · SSE 流式 · FastAPI 异步 · SQLAlchemy 2.x · Vue 3 + TypeScript · Docker Compose
+**技术栈**：Python / FastAPI / SQLAlchemy / MySQL / Redis / LangGraph / Vue 3 / SSE / Docker Compose / Nginx。
 
-**项目规模**：后端 52 个 Python 文件 · 前端 25 个 Vue/TS 文件 · 11 张数据库表 · 13 个 Agent 工具 · **259 项可执行测试断言**
+### 核心设计
+
+| 设计 | 可检查的实现 |
+|---|---|
+| 业务入口共享规则 | REST API 与 Agent 工具复用 Service；身份通过后端 `ToolContext` 注入，不让模型指定操作者 |
+| 计划与执行分开 | 批量工具先生成 MySQL 待审批计划；确认只允许缩小原工单集合，不能扩大范围或改写业务参数 |
+| 并发审批有唯一决定者 | 数据库条件更新抢占仍有效的 `pending` 计划；重复确认、确认与拒绝竞争时，仅一个决定成功 |
+| 结构化结果与展示分开 | 完整工具结果保存在 `observations` 中供预览与引用使用，避免从截断的展示 JSON 反解析业务数据 |
+| 单条失败可定位 | 批量操作使用 SAVEPOINT 隔离单条失败，成功部分随外层事务提交，返回失败清单 |
+| 过程可检查 | SSE 推送意图、工具与审批结果；运行和步骤记录落库；Nginx 对 SSE 关闭代理缓冲 |
+
+审批并发、权限与目标范围提供离线回归；完整演示、服务集成检查和执行恢复边界见[可靠性验证文档](docs/RELIABILITY.md)。
+
+### 快速体验
+
+在项目根目录执行，需先安装并启动 Docker：
+
+```bash
+cp .env.example .env
+# 编辑 .env 中的 LLM_API_KEY；基础工单功能不依赖模型调用
+docker compose up -d --build
+docker compose ps
+# 等后端就绪后，仅向本地演示库生成测试数据
+docker compose exec backend python scripts/seed.py
+```
+
+PowerShell 可用 `Copy-Item .env.example .env` 代替第一条命令。访问 [本地界面](http://127.0.0.1:8080)，演示账号为 `admin / admin123456`。先看工单与看板，再打开右下角 AI 助手，按“查询候选工单 → 批量调整优先级 → 核对并缩小勾选范围 → 确认”体验。种子数据是模拟数据；默认账号和密钥配置仅用于隔离演示环境。
+
+### 验证入口
+
+```bash
+cd backend
+python -m pip install -r requirements.txt
+python -m pytest tests_offline
+```
+
+上面的审批回归使用临时 SQLite，不需要 MySQL、Redis、LLM Key 或启动 API 服务。它验证审批决定与参数边界，不代表真实 MySQL、代理流式传输或模型端到端验证。
+
+- [演示步骤、验证分层与可靠性边界](docs/RELIABILITY.md)：包含可复现命令、验收观察点和故障定位案例。
+- [本地开发与部署](#四快速开始)：Compose 与前后端分别启动。
+- [Agent 架构](#六agent-架构详解) / [审批机制](#八human-in-the-loop-详解) / [开发问题记录](#十三开发过程中解决的真实问题)。
+- [测试与验证](#十二测试与验证)：历史集成脚本与本次新增的离线回归分开说明。
 
 ---
 
-## 目录
+<details>
+<summary>完整目录</summary>
 
 - [一、这个项目解决什么问题](#一这个项目解决什么问题)
 - [二、功能清单](#二功能清单)
@@ -31,6 +69,8 @@
 - [十五、环境变量](#十五环境变量)
 - [十六、常见问题](#十六常见问题)
 - [十七、已知不足与后续规划](#十七已知不足与后续规划)
+
+</details>
 
 ---
 
@@ -108,7 +148,7 @@ Agent 工具**不允许直接碰数据库**，只能调 Service 层。这保证�
 | 工具调用 | 13 个业务工具，ReAct 循环，支持多轮连续调用 |
 | 多轮对话 | 会话历史存库，注入最近 10 条作为上下文 |
 | 流式反馈 | SSE 实时推送：意图 → 思考 → 工具调用卡片 → 打字机回答 → 引用工单 |
-| 执行过程回放 | `agent_run_steps` 落库，刷新页面后可通过 run_id 完整回放 |
+| 执行过程记录 | `agent_run_steps` 落库，可通过 run_id 查询步骤；前端历史回放 UI 尚未完成 |
 | 防幻觉 | 回答中引用的工单号全部来自真实查询结果，前端渲染成可点击标签 |
 | 循环保护 | 最大 12 步 + 单次 50k token 上限 + 120s 超时，三重保险 |
 | 成本可观测 | `agent_runs` 记录每次运行的 token 消耗 / 工具调用次数 / 耗时 |
@@ -120,9 +160,10 @@ Agent 工具**不允许直接碰数据库**，只能调 Service 层。这保证�
 | 强制确认 | 批量操作（`batch_update_tickets` / `batch_assign_tickets`）无条件需要人工确认 |
 | 确认卡片 | 列出**具体工单号和标题**（不是数字），支持逐条取消勾选 |
 | 倒计时 | 10 分钟有效期，过期自动作废 |
-| 幂等保护 | 重复点确认返回 409，不会执行两遍 |
-| 部分成功 | SAVEPOINT 实现逐条独立提交，17 条里 1 条失败不影响其余 16 条 |
-| 审计闭环 | 工单的 `ticket_events` 记录 `batch: true` 标记，可回溯到是哪次 AI 运行、谁批准的 |
+| 并发决定 | 数据库条件更新仅允许一个有效 `pending` 计划被确认或拒绝；审批流冲突通过 SSE `error` 事件返回 |
+| 确认范围 | `edited_payload` 只接收原计划内的非空、不重复正整数 `ticket_ids`，不能改写工具、优先级或负责人 |
+| 部分成功 | SAVEPOINT 隔离单条失败，成功部分在批量方法末尾统一提交；不等同于每条独立提交 |
+| 操作记录 | `ticket_events` 记录操作者及 `batch: true`；审批决定与结果另存 `agent_pending_actions`，按 action_id / run_id 排查 |
 
 ## 三、系统架构
 
@@ -200,7 +241,7 @@ Agent 工具**不允许直接碰数据库**，只能调 Service 层。这保证�
 # ① 准备环境变量
 cp .env.example .env
 #    编辑 .env，把 LLM_API_KEY 换成你自己的
-#    申请地址：https://bailian.console.aliyun.com/（有免费额度）
+#    需要支持 OpenAI 兼容接口、结构化输出与工具调用的模型配置
 
 # ② 构建并启动（4 个容器：mysql / redis / backend / frontend）
 docker compose up -d --build
@@ -304,13 +345,13 @@ npm run dev
 输入：线上支付接口大量出现 502，今天下午开始一直有用户反馈支付失败，帮我报个故障。
 
 Agent 执行链（前端实时可见）：
-  ① 意图识别 → create_ticket（置信度 0.98）
+  ① 意图识别 → create_ticket（具体结果取决于模型）
   ② 实体抽取 → {title: "支付接口大量返回 502", category: "payment", priority: "urgent"}
   ③ 调用 create_ticket 工具
   ④ 返回：工单号 OPS-202609-000123，SLA 截止时间已按 urgent(4h) 自动计算
 ```
 
-实测模型输出：`create_ticket({"title": "支付接口大量返回 502", "category": "payment", "priority": "urgent", ...})` —— 参数提取完全正确。
+工具调用示例：`create_ticket({"title": "支付接口大量返回 502", "category": "payment", "priority": "urgent", ...})`。此处展示预期结构，不作为模型准确率或本次实测结果。
 
 ### 场景 2 · 查询工单
 
@@ -341,18 +382,18 @@ Agent 执行链：
 
 Agent 执行链：
   ① 意图 → batch_update
-  ② list_tickets(unhandled_hours=24, limit=100)     ← 只读，直接执行，找到 22 条
+  ② list_tickets(unhandled_hours=24, limit=100)     ← 只读，核查真实数量与截断标记
   ③ list_departments()                              ← 把"技术部门"映射成 department_id
   ④ 模型请求 batch_update_tickets(...)              ← 高风险！被 guard 节点拦截
   ⑤ 生成执行计划 → 落库 agent_pending_actions → SSE 推送确认卡片
-  ⑥ ⏸ 等待人工确认（10 分钟倒计时，服务重启也不丢）
-  ⑦ 用户核对 22 条工单，取消勾选 2 条 → 点「确认执行」
-  ⑧ 事务内批量执行，逐条 SSE 推送进度
+  ⑥ ⏸ 等待人工确认（默认 10 分钟；待审计划已持久化）
+  ⑦ 用户核对候选工单，取消不需要的条目 → 点「确认执行」
+  ⑧ 事务内批量执行，SSE 返回阶段与最终结果
   ⑨ 完成后：工单 priority=high、部门=技术部、状态=processing
-     ticket_events 记录 batch:true 标记，可回溯到本次 AI 运行
+     ticket_events 记录 batch:true 和操作者；待审批记录保存关联 run_id 与决定
 ```
 
-**验证过的安全边界**：确认前数据零改动；重复提交被 409 拦截（幂等）；拒绝路径数据零改动；普通用户发起批量操作被权限层直接拒绝。
+**需要核查的边界**：生成计划和拒绝计划不会触发该批量工单修改（仍会写审批/运行记录）；确认范围只能缩小；并发确认只有一个决定成功；普通用户不能执行批量操作。见[分层验证说明](docs/RELIABILITY.md)。审批端点是 SSE 流，业务冲突以 `error` 事件表达，不能只看 HTTP 状态码。
 
 ## 六、Agent 架构详解
 
@@ -381,7 +422,7 @@ agent ◄─────────────┐                    │
 | `understand` | 意图分类 + 实体抽取 | `with_structured_output` + `Literal` 枚举强约束；失败降级为 chat 而不是崩溃 |
 | `agent` | ReAct：决定调什么工具 | 只绑定当前意图白名单内的工具 |
 | `tools` | 执行工具 | 结果截断后回灌模型；结构化数据同时存入 observations |
-| `guard` | 高风险拦截 → 生成计划 | **不执行任何写操作**，只落库 + 推确认卡片 |
+| `guard` | 高风险拦截 → 生成计划 | 不执行被拦截的工单修改；写入待审批计划并推确认卡片 |
 | `respond` | 生成最终回答 | 收集引用工单（防幻觉）|
 
 **循环保护（三重）**：`step_count >= 12` 强制收尾 · `total_tokens >= 50000` 中断 · 120 秒图级超时。
@@ -417,7 +458,7 @@ async def list_tickets(status: str = None, config: RunnableConfig = None):
     ctx = ToolContext.from_config(config)   # ← 身份由后端注入
 ```
 
-LangChain 自动把 `config` 参数从工具的 JSON Schema 里剔除 —— 模型既看不到它也无法提供它。**测试断言遍历全部 13 个工具，验证 schema 中不出现 `user_id` / `creator_id` / `ctx` / `config`。**
+LangChain 自动把 `config` 参数从工具的 JSON Schema 里剔除，身份由后端提供。历史工具验证脚本遍历工具 schema，检查不出现 `user_id` / `creator_id` / `ctx` / `config`；具体执行结果以本次日志为准。
 
 ### 6.4 意图 → 工具白名单
 
@@ -455,13 +496,13 @@ LangChain 自动把 `config` 参数从工具的 JSON Schema 里剔除 —— 模
 | `tool_result` | 工具返回 | 卡片转完成态 + 耗时 |
 | `plan` | 生成执行计划 | **★ 确认卡片** |
 | `awaiting_approval` | 图挂起 | 锁定输入框 + 倒计时 |
-| `action_executed` | 批量执行中每条 | 进度 +1 |
+| `action_executed` | 预留的单条进度事件，当前执行器未逐条推送 | 前端已预留进度展示 |
 | `action_finished` | 批量执行结束 | 成功/失败汇总 |
 | `token` | 回答增量文本 | 打字机效果 |
 | `citations` | 引用工单列表 | 可点击标签 |
 | `message` | 消息落库 | 持久化消息 ID |
 | `error` | 出错 | 错误提示（不泄露堆栈）|
-| `done` | 结束（**必定发送**）| 恢复输入框 |
+| `done` | 正常结束或已捕获的失败收尾；网络/进程故障不保证送达 | 恢复输入框 |
 
 前端遇到未知事件名一律忽略不报错 —— 后端加新事件不会让老前端崩溃（前向兼容）。
 
@@ -488,7 +529,7 @@ LangChain 自动把 `config` 参数从工具的 JSON Schema 里剔除 —— 模
 | | 两阶段（本项目） | interrupt + Checkpointer |
 |---|---|---|
 | 等待状态存哪 | MySQL 业务表 | Redis 序列化结构 |
-| 服务重启 | 不受影响 | 内存版会丢 |
+| 服务重启 | 待审记录保留；执行中断不自动恢复 | 内存版会丢，持久化方案取决于存储与恢复设计 |
 | 可查询/统计 | ✅ 普通业务表 | ❌ 需解析序列化数据 |
 | 额外依赖 | 无 | 需要 Checkpointer |
 | 上下文连续性 | 简化（参数完整存计划里）| 完整保留图内状态 |
@@ -507,16 +548,19 @@ LangChain 自动把 `config` 参数从工具的 JSON Schema 里剔除 —— 模
 | **倒计时明确** | 避免用户以为点了就永久等待 |
 | 拒绝按钮同等显眼 | 不做诱导确认的暗黑模式 |
 
-### 8.3 安全边界（全部有测试覆盖）
+### 8.3 审批边界与验证范围
 
 | 保护 | 实现 |
 |---|---|
-| 确认前零改动 | guard 节点不执行任何写操作 |
-| 幂等 | 只有 `pending` 状态可被决定，重复提交 409 |
+| 确认前不执行批量变更 | guard 只写计划和运行记录，不执行该批量工单修改 |
+| 并发决定 | 条件更新要求 `pending`、尚未过期且用户有效；只有一个请求成功决定 |
+| 目标范围 | 确认只能提交原计划 `ticket_ids` 的非空子集；拒绝新增 ID、重复 ID、超限或额外字段 |
 | 过期 | 超时自动作废，需重新发起 |
 | 二次权限校验 | 执行时重新验证用户身份（防 TOCTOU：提交时有权限、执行时已降权）|
 | 批量上限 | 单次最多 100 条（`AGENT_BATCH_LIMIT` 安全阀）|
-| 部分成功 | SAVEPOINT 逐条独立，失败清单完整返回 |
+| 部分成功 | SAVEPOINT 隔离单条失败，成功部分统一提交；失败清单返回 |
+
+离线回归主要验证审批 Service 的状态竞争与参数约束；MySQL、Service 批量执行、API/SSE 与真实模型需要另外做集成验证。待审计划持久化不等同于已批准执行的崩溃恢复，详见[可靠性边界](docs/RELIABILITY.md)。
 
 ## 九、数据库设计
 
@@ -547,8 +591,8 @@ LangChain 自动把 `config` 参数从工具的 JSON Schema 里剔除 —— 模
 **③ 为什么时间统一存 UTC？**
 跨时区一致性。所有 `DATETIME` 字段存 UTC，出参经 `UTCDatetime` 序列化器统一带 `Z` 后缀，前端 `new Date()` 自动转本地时区。（踩过的坑：不加 Z 后缀时北京时间会凭空多 8 小时）
 
-**④ 软删除？**
-不做。工单业务中"删除"用 `cancelled` 状态表达，物理删除会破坏审计链。
+**④ 删除与关闭？**
+工单正常生命周期用 `closed` 终态结束；当前另有仅 admin 可调用的物理删除接口，Agent 不提供删除工具。二者不是软删除与恢复机制。
 
 ## 十、API 接口清单
 
@@ -669,9 +713,21 @@ OpsPilot/
 
 ## 十二、测试与验证
 
-**259 项断言，全部通过。** 不是"我测过了"，是**你可以自己跑一遍**：
+### 12.1 离线审批回归
 
-| 脚本 | 覆盖 | 断言数 | 需要 |
+从项目根目录进入 `backend`，安装 `requirements.txt` 后运行：
+
+```bash
+python -m pytest tests_offline
+```
+
+测试位于 `backend/tests_offline/`，使用临时 SQLite 与独立 Session 验证并发审批、过期、用户边界和确认集合约束，不调用模型或连接现有 MySQL/Redis。结果以终端或 CI 输出为准；测试的具体覆盖与尚未验证项见[验证说明](docs/RELIABILITY.md)。
+
+### 12.2 历史集成脚本
+
+下面保留原项目的集成脚本及历史断言数量，合计 **259 项**。这是历史记录，本次没有据此宣称“259 项全部通过”，也不将它与离线 pytest 用例数混计。这些脚本需要真实服务，部分会修改数据库、调用模型；应在隔离的演示环境中运行。
+
+| 脚本（相对 `backend/`） | 覆盖 | 历史断言数 | 需要 |
 |---|---|---|---|
 | `scripts/test_auth.py` | 注册查重/登录/密码错误/伪造 token/防枚举 | 31 | 后端 |
 | `scripts/test_tickets.py` | 状态机/权限/SLA 重算/筛选/分页/越权 | 49 | 后端 + 种子数据 |
@@ -683,14 +739,14 @@ OpsPilot/
 
 辅助脚本：`test_llm.py`（LLM 连通性三连测）· `check_deps.py`（依赖完整性静态检查）· `smoke_test.py`（基础冒烟）
 
-### 几个值得一提的验证点
+### 历史脚本中的检查项（需实际运行确认）
 
 ```text
-✓ 遍历全部工具，断言 schema 里不出现 user_id/config —— 身份隔离真的成立
-✓ 断言 SSE 首事件到达时间远早于流结束 —— 证明真流式，没被代理缓冲
-✓ 场景 4 验证：确认前数据未变、勾选 3 条只执行 3 条、重复提交被 409 拦截
-✓ 登出后原 token 立即 401，另一个用户的 token 不受影响
-✓ 普通用户改他人工单返回 403，改自己的放行
+- 工具 schema 中不出现可由模型填写的 user_id/config
+- SSE 首事件早于流结束，检查是否被代理缓冲
+- 生成批量计划后工单未改、只执行勾选范围、重复决定被拒绝
+- 登出后原 token 被拒绝，另一个用户的 token 不受影响
+- 普通用户修改自己与他人工单时的数据权限
 ```
 
 跑法：
@@ -703,7 +759,7 @@ python scripts/test_agent.py --only batch   # 只跑场景 4（省 token）
 
 ## 十三、开发过程中解决的真实问题
 
-这些问题全部是**真实跑起来才暴露**的，每一个都有对应的测试防回归。这也是这个项目的价值之一 —— 不是抄来的 Demo。
+以下保留开发过程中的问题与修复记录，便于对照源码讨论数据契约、事务与部署问题。历史记录不等同于所有场景都已建立自动回归；本次新增验证的范围见[可靠性文档](docs/RELIABILITY.md)。
 
 ### 🔴 P0 · 模型在编造工单 ID
 
@@ -860,6 +916,9 @@ taskkill /F /T /PID <PID>
 
 | 不足 | 现状 | 改进方向 |
 |---|---|---|
+| 审批决定与业务执行不是同一原子提交 | 并发审批只有一个决定成功，但批准后进程崩溃可能停在 `approved`，也可能业务已提交而结果未落库 | 执行状态、恢复任务与业务幂等键；当前不承诺 exactly-once |
+| SQLite 回归不能代替 MySQL 验证 | 离线验证状态竞争和参数约束，未覆盖目标数据库的锁等待、死锁及真实并发部署 | 在独立 MySQL 环境补集成回归与故障注入 |
+| 单条高风险审批路径需继续完善 | 当前审批执行器支持两种批量工具；策略也会标记某些单条高风险操作 | 扩展执行器映射并增加端到端测试后再扩大保证范围 |
 | 无法踢掉某用户全部会话 | 黑名单按单 token 粒度 | 用户级"签发时间戳"，校验 token iat 是否早于它 |
 | 批量执行同步阻塞 | 100 条内可接受 | 分批 + 异步任务队列（但注意不过度工程化）|
 | 无附件上传 | — | MinIO + 类型/大小校验 |
@@ -876,6 +935,7 @@ taskkill /F /T /PID <PID>
 
 - 📐 [PROJECT_ARCHITECTURE.md](./PROJECT_ARCHITECTURE.md) —— 完整架构设计（15 章节：产品定位/数据模型/Agent 架构/SSE 事件/HITL 流程/风险清单）
 - 🔧 [backend/README.md](./backend/README.md) —— 后端开发指南（Windows 踩坑记录）
+- 🧪 [docs/RELIABILITY.md](./docs/RELIABILITY.md) —— 演示步骤、自动回归、集成验证与恢复边界
 
 ---
 

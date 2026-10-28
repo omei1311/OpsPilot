@@ -14,11 +14,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
+from app.core.exceptions import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from app.core.logging import get_logger
 from app.models.agent import (
     AgentConversation,
@@ -36,6 +36,41 @@ logger = get_logger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _approved_payload(
+    payload: dict[str, Any], edited_payload: dict[str, Any] | None
+) -> tuple[dict[str, Any], int]:
+    """确认时仅允许缩小已持久化的目标集合，不能修改工具或业务参数。"""
+    args = payload.get("args") if isinstance(payload, dict) else None
+    original_ids = args.get("ticket_ids") if isinstance(args, dict) else None
+    if (
+        not isinstance(original_ids, list)
+        or not original_ids
+        or any(type(ticket_id) is not int or ticket_id <= 0 for ticket_id in original_ids)
+        or len(set(original_ids)) != len(original_ids)
+    ):
+        raise ConflictError("原执行计划的工单范围无效，请重新生成计划")
+
+    selected_ids = original_ids
+    if edited_payload is not None:
+        if not isinstance(edited_payload, dict) or set(edited_payload) != {"ticket_ids"}:
+            raise BadRequestError("确认时仅允许修改 ticket_ids 勾选范围")
+        selected_ids = edited_payload["ticket_ids"]
+        if (
+            not isinstance(selected_ids, list)
+            or not selected_ids
+            or any(type(ticket_id) is not int or ticket_id <= 0 for ticket_id in selected_ids)
+            or len(set(selected_ids)) != len(selected_ids)
+        ):
+            raise BadRequestError("请选择不重复的正整数工单 ID，空选请拒绝本次操作")
+        if not set(selected_ids).issubset(original_ids):
+            raise BadRequestError("只能取消原计划中的工单，不能添加新的执行目标")
+
+    if len(selected_ids) > settings.AGENT_BATCH_LIMIT:
+        raise BadRequestError(f"单次最多处理 {settings.AGENT_BATCH_LIMIT} 条工单")
+
+    return {**payload, "args": {**args, "ticket_ids": list(selected_ids)}}, len(selected_ids)
 
 
 class AgentService:
@@ -309,54 +344,93 @@ class AgentService:
         edited_payload: dict[str, Any] | None = None,
         note: str | None = None,
     ) -> AgentPendingAction:
-        """记录审批决定。
+        """由数据库原子抢占审批决定；只有获胜的请求可以进入执行流程。
 
-        ★ 这里的并发保护很关键。
-
-        用户可能双击"确认"按钮，或者网络重试导致请求发两次。
-        如果不做保护，批量操作会被执行两遍 —— 数据就错了。
-
-        保护方式：只有状态是 PENDING 的才能被决定。
-        第二次请求进来时状态已经是 APPROVED，直接抛 409。
-        这就是"幂等性"的实现方式。
+        Python 内判断状态不能保护同时读到 pending 的两个请求。这里用
+        UPDATE 的状态、有效期和权限条件决定唯一获胜者；失败请求回滚，
+        不能覆盖已批准、拒绝或过期的决定。不自动重试已批准的执行，
+        也不把这一保证扩大为进程崩溃后的 exactly-once 业务执行。
         """
+        action_id, user_id = action.action_id, user.id
+        # 原对象可能在请求排队期间过时。重新读取持久化的计划与用户权限；
+        # populate_existing 避免 identity map 返回之前缓存的属性。
+        action = await db.scalar(
+            select(AgentPendingAction)
+            .where(AgentPendingAction.action_id == action_id)
+            .execution_options(populate_existing=True, autoflush=False)
+        )
+        if action is None:
+            raise NotFoundError("待确认操作不存在")
+        current_user = await db.scalar(
+            select(User)
+            .where(User.id == user_id)
+            .execution_options(populate_existing=True, autoflush=False)
+        )
+        if current_user is None or not current_user.is_active:
+            raise ForbiddenError("当前账号不可执行审批")
+        if action.requested_by != user_id and current_user.role != UserRole.ADMIN:
+            raise ForbiddenError("无权操作该待确认项")
         if action.status != PendingActionStatus.PENDING:
             raise ConflictError(
                 f"该操作已经是「{action.status}」状态，不能重复处理",
                 detail={"action_id": action.action_id, "status": action.status},
             )
 
-        # 过期检查：避免用户放着不管几小时后突然点确认
-        if action.expires_at < _now():
-            action.status = PendingActionStatus.EXPIRED
-            await db.commit()
-            raise ConflictError(
-                "该操作已超时失效，请重新发起",
-                detail={"action_id": action.action_id},
+        # 将权限放进 UPDATE 条件，覆盖用户在上面读取之后被停用/降权的情况。
+        authorized = exists(
+            select(User.id).where(
+                User.id == user_id,
+                User.is_active.is_(True),
+                or_(User.role == UserRole.ADMIN, AgentPendingAction.requested_by == user_id),
             )
-
-        action.status = (
-            PendingActionStatus.APPROVED if approve else PendingActionStatus.REJECTED
         )
-        action.decided_by = user.id
-        action.decided_at = _now()
-        action.decision_note = note
+        now = _now()
+        expired = action.expires_at <= now
+        values: dict[str, Any]
+        if expired:
+            values = {"status": PendingActionStatus.EXPIRED}
+        else:
+            values = {
+                "status": PendingActionStatus.APPROVED if approve else PendingActionStatus.REJECTED,
+                "decided_by": user_id,
+                "decided_at": now,
+                "decision_note": note,
+            }
+            if approve:
+                values["payload"], values["affected_count"] = _approved_payload(
+                    action.payload, edited_payload
+                )
 
-        # 用户可以在确认时改勾选（比如从 17 条改成 15 条）
-        if approve and edited_payload:
-            ids = edited_payload.get("ticket_ids")
-            if isinstance(ids, list) and ids:
-                action.payload = {**action.payload, "args": {**action.payload.get("args", {}), "ticket_ids": ids}}
-                action.affected_count = len(ids)
-
+        stmt = (
+            update(AgentPendingAction)
+            .where(
+                AgentPendingAction.action_id == action_id,
+                AgentPendingAction.status == PendingActionStatus.PENDING,
+                authorized,
+                AgentPendingAction.expires_at <= now
+                if expired
+                else AgentPendingAction.expires_at > now,
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False, autoflush=False)
+        )
+        result = await db.execute(stmt)
+        if result.rowcount != 1:
+            await db.rollback()
+            raise ConflictError(
+                "该操作的状态、有效期或审批权限已变化，请刷新后重试",
+                detail={"action_id": action_id},
+            )
         await db.commit()
         await db.refresh(action)
+        if expired:
+            raise ConflictError("该操作已超时失效，请重新发起", detail={"action_id": action_id})
 
         logger.info(
             "审批决定 | action_id=%s approve=%s by=%s affected=%s",
             action.action_id,
             approve,
-            user.username,
+            user_id,
             action.affected_count,
         )
         return action
@@ -385,12 +459,10 @@ class AgentService:
         Returns:
             本次过期的条数
         """
-        from sqlalchemy import update
-
         stmt = (
             update(AgentPendingAction)
             .where(AgentPendingAction.status == PendingActionStatus.PENDING)
-            .where(AgentPendingAction.expires_at < _now())
+            .where(AgentPendingAction.expires_at <= _now())
             .values(status=PendingActionStatus.EXPIRED)
         )
         result = await db.execute(stmt)

@@ -1,7 +1,7 @@
 # 只放工具配置。依赖声明统一在 requirements.txt 里，避免两处维护。
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tests_offline"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
